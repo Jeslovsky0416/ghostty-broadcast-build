@@ -1,0 +1,279 @@
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 407fa59..505c4f0 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1028,6 +1028,7 @@ typedef enum {
+   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
+   GHOSTTY_ACTION_SYNC_BROADCAST_GROUP,
+   GHOSTTY_ACTION_RESIZE_WINDOW,
++  GHOSTTY_ACTION_JOIN_WINDOW_BROADCAST_GROUP,
+ } ghostty_action_tag_e;
+ 
+ typedef union {
+@@ -1184,6 +1185,10 @@ GHOSTTY_API void ghostty_app_open_config(ghostty_app_t);
+ GHOSTTY_API void ghostty_app_update_config(ghostty_app_t, ghostty_config_t);
+ GHOSTTY_API bool ghostty_app_needs_confirm_quit(ghostty_app_t);
+ GHOSTTY_API bool ghostty_app_has_global_keybinds(ghostty_app_t);
++// Main-thread only. Joins the supplied live surfaces, excluding all others.
++GHOSTTY_API bool ghostty_app_join_broadcast_group(ghostty_app_t,
++                                               const ghostty_surface_t*,
++                                               uintptr_t);
+ GHOSTTY_API void ghostty_app_set_color_scheme(ghostty_app_t, ghostty_color_scheme_e);
+ 
+ GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
+diff --git a/macos/Sources/Ghostty/Ghostty.App.swift b/macos/Sources/Ghostty/Ghostty.App.swift
+index a35a2e6..b791272 100644
+--- a/macos/Sources/Ghostty/Ghostty.App.swift
++++ b/macos/Sources/Ghostty/Ghostty.App.swift
+@@ -786,6 +786,9 @@ extension Ghostty {
+             case GHOSTTY_ACTION_SYNC_BROADCAST_GROUP:
+                 return syncBroadcastGroup(app, target: target, v: action.action.sync_broadcast_group)
+ 
++            case GHOSTTY_ACTION_JOIN_WINDOW_BROADCAST_GROUP:
++                return joinWindowBroadcastGroup(app, target: target)
++
+             default:
+                 Ghostty.logger.warning("unknown action action=\(action.tag.rawValue, privacy: .public)")
+                 return false
+@@ -1287,6 +1290,26 @@ extension Ghostty {
+                 return true
+         }
+ 
++        private static func joinWindowBroadcastGroup(
++            _ app: ghostty_app_t,
++            target: ghostty_target_s) -> Bool {
++                guard target.tag == GHOSTTY_TARGET_SURFACE,
++                      let surface = target.target.surface,
++                      let surfaceView = self.surfaceView(from: surface),
++                      let window = surfaceView.window else { return false }
++
++                let windows = window.tabGroup?.windows ?? [window]
++                let surfaces: [ghostty_surface_t?] = windows.flatMap { tab in
++                    guard let controller = tab.windowController as? BaseTerminalController else {
++                        return [ghostty_surface_t?]()
++                    }
++                    return controller.surfaceTree.compactMap { $0.surface }.map { Optional($0) }
++                }
++                return surfaces.withUnsafeBufferPointer {
++                    ghostty_app_join_broadcast_group(app, $0.baseAddress, UInt($0.count))
++                }
++        }
++
+         private static func syncBroadcastGroup(
+             _ app: ghostty_app_t,
+             target: ghostty_target_s,
+diff --git a/macos/build.nu b/macos/build.nu
+index 98d0b40..e356e6d 100755
+--- a/macos/build.nu
++++ b/macos/build.nu
+@@ -7,9 +7,11 @@ def main [
+     --scheme: string = "Ghostty"       # Xcode scheme (Ghostty, DockTilePlugin)
+     --configuration: string = "Debug"  # Build configuration (Debug, Release, ReleaseLocal)
+     --action: string = "build"         # xcodebuild action (build, test, clean, etc.)
++    --arch: string = ""                # Optional architecture for native-only builds
+ ] {
+     let project = ($env.FILE_PWD | path join "Ghostty.xcodeproj")
+     let build_dir = ($env.FILE_PWD | path join "build")
++    let arch_args = if $arch == "" { [] } else { [-arch $arch] }
+ 
+     # Skip UI tests for CLI-based invocations because it requires
+     # special permissions.
+@@ -28,5 +30,6 @@ def main [
+         -configuration $configuration
+         $"SYMROOT=($build_dir)"
+         ...$skip_testing
++        ...$arch_args
+         $action)
+ }
+diff --git a/src/App.zig b/src/App.zig
+index 7cc1d63..83cdad9 100644
+--- a/src/App.zig
++++ b/src/App.zig
+@@ -604,6 +604,57 @@ pub fn toggleNumberedBroadcastGroup(
+     return true;
+ }
+ 
++/// Join an explicitly selected set without linking it to any outside surface.
++/// The caller supplies the current window's tabs and splits on the main thread.
++pub fn joinBroadcastGroup(
++    self: *App,
++    rt_app: *apprt.App,
++    targets: []const ?*apprt.Surface,
++) bool {
++    if (targets.len == 0 or targets.len > self.surfaces.items.len) return false;
++    for (targets) |maybe_surface| {
++        const surface = maybe_surface orelse return false;
++        if (std.mem.indexOfScalar(*apprt.Surface, self.surfaces.items, surface) == null)
++            return false;
++    }
++
++    var outside: std.StaticBitSet(max_broadcast_groups) = .initEmpty();
++    for (self.surfaces.items) |surface| {
++        if (std.mem.indexOfScalar(?*apprt.Surface, targets, surface) != null) continue;
++        if (surface.core().broadcast_group) |group| outside.set(group);
++    }
++    const group = windowBroadcastGroup(outside, targets[0].?.core().broadcast_group) orelse {
++        log.warn("no broadcast group available for the current window", .{});
++        return false;
++    };
++
++    for (targets) |surface| surface.?.core().broadcast_group = group;
++    for (targets) |surface| syncBroadcastGroup(rt_app, surface.?.core());
++    return true;
++}
++
++fn windowBroadcastGroup(outside: std.StaticBitSet(max_broadcast_groups), current: ?u4) ?u4 {
++    if (current) |group| {
++        if (!outside.isSet(group)) return group;
++    }
++    const unused = outside.complement().findFirstSet() orelse return null;
++    return @intCast(unused);
++}
++
++test "window broadcast group stays local and idempotent" {
++    const testing = std.testing;
++    var outside: std.StaticBitSet(max_broadcast_groups) = .initEmpty();
++    try testing.expectEqual(@as(?u4, 0), windowBroadcastGroup(outside, null));
++    try testing.expectEqual(@as(?u4, 3), windowBroadcastGroup(outside, 3));
++    outside.set(0);
++    outside.set(3);
++    try testing.expectEqual(@as(?u4, 1), windowBroadcastGroup(outside, 3));
++    try testing.expectEqual(@as(?u4, 1), windowBroadcastGroup(outside, 1));
++    outside = .initFull();
++    try testing.expectEqual(@as(?u4, null), windowBroadcastGroup(outside, null));
++    try testing.expectEqual(@as(?u4, null), windowBroadcastGroup(outside, 3));
++}
++
+ /// Dissolve all broadcast groups. This is the implementation of the
+ /// `clear_broadcast_groups` keybinding action.
+ fn clearBroadcastGroups(self: *App, rt_app: *apprt.App) void {
+diff --git a/src/Surface.zig b/src/Surface.zig
+index c893b23..e518b48 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -5550,6 +5550,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool
+             v,
+         ),
+ 
++        .join_window_broadcast_group => return try self.rt_app.performAction(
++            .{ .surface = self },
++            .join_window_broadcast_group,
++            {},
++        ),
++
+         .move_tab_to_new_window => return try self.rt_app.performAction(
+             .{ .surface = self },
+             .move_tab_to_new_window,
+diff --git a/src/apprt/action.zig b/src/apprt/action.zig
+index ead7e22..66e3047 100644
+--- a/src/apprt/action.zig
++++ b/src/apprt/action.zig
+@@ -370,6 +370,9 @@ pub const Action = union(Key) {
+     /// split or the window is fullscreen.
+     resize_window: ResizeWindow,
+ 
++    /// Join all tabs and splits in the target surface's macOS window.
++    join_window_broadcast_group,
++
+     /// Sync with: ghostty_action_tag_e
+     pub const Key = enum(c_int) {
+         quit,
+@@ -443,6 +446,7 @@ pub const Action = union(Key) {
+         move_tab_to_new_window,
+         sync_broadcast_group,
+         resize_window,
++        join_window_broadcast_group,
+ 
+         test "ghostty.h Action.Key" {
+             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index b90366a..452c57a 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -1783,6 +1783,15 @@ pub const CAPI = struct {
+         return v.hasGlobalKeybinds();
+     }
+ 
++    export fn ghostty_app_join_broadcast_group(
++        v: *App,
++        surfaces: ?[*]const ?*Surface,
++        len: usize,
++    ) bool {
++        const ptr = surfaces orelse return false;
++        return v.core_app.joinBroadcastGroup(v, ptr[0..len]);
++    }
++
+     /// Update the color scheme of the app.
+     export fn ghostty_app_set_color_scheme(v: *App, scheme_raw: c_int) void {
+         const scheme = std.enums.fromInt(apprt.ColorScheme, scheme_raw) orelse return;
+diff --git a/src/apprt/gtk/class/application.zig b/src/apprt/gtk/class/application.zig
+index dcd0be0..aa25669 100644
+--- a/src/apprt/gtk/class/application.zig
++++ b/src/apprt/gtk/class/application.zig
+@@ -806,6 +806,7 @@ pub const Application = extern struct {
+             .search_selected => Action.searchSelected(target, value),
+ 
+             // Unimplemented
++            .join_window_broadcast_group,
+             .secure_input,
+             .close_all_windows,
+             .float_window,
+diff --git a/src/config/Config.zig b/src/config/Config.zig
+index c73a9d3..9d94599 100644
+--- a/src/config/Config.zig
++++ b/src/config/Config.zig
+@@ -7150,6 +7150,14 @@ pub const Keybinds = struct {
+             );
+         }
+ 
++        if (builtin.target.os.tag.isDarwin()) {
++            try self.set.put(
++                alloc,
++                .{ .key = .{ .unicode = 'i' }, .mods = .{ .super = true, .ctrl = true } },
++                .{ .join_window_broadcast_group = {} },
++            );
++        }
++
+         // Toggle fullscreen
+         try self.set.put(
+             alloc,
+diff --git a/src/input/Binding.zig b/src/input/Binding.zig
+index db01126..08dd324 100644
+--- a/src/input/Binding.zig
++++ b/src/input/Binding.zig
+@@ -696,6 +696,10 @@ pub const Action = union(enum) {
+     /// broadcast input groups.
+     clear_broadcast_groups,
+ 
++    /// Join all tabs and splits of the current macOS window to one broadcast
++    /// group without including terminals from other windows.
++    join_window_broadcast_group,
++
+     /// Resize the current split in the specified direction and amount in
+     /// pixels. The two arguments should be joined with a comma (`,`),
+     /// like in `resize_split:up,10`.
+@@ -1514,6 +1518,7 @@ pub const Action = union(enum) {
+             .toggle_split_zoom,
+             .toggle_readonly,
+             .toggle_broadcast_group,
++            .join_window_broadcast_group,
+             .resize_split,
+             .equalize_splits,
+             .inspector,
+diff --git a/src/input/command.zig b/src/input/command.zig
+index b4b1fbb..0b90da1 100644
+--- a/src/input/command.zig
++++ b/src/input/command.zig
+@@ -703,6 +703,12 @@ fn actionCommands(action: Action.Key) []const Command {
+             .description = i18n.N_("Remove all terminals from broadcast input groups."),
+         }},
+ 
++        .join_window_broadcast_group => comptime &.{.{
++            .action = .join_window_broadcast_group,
++            .title = i18n.N_("Broadcast to All Tabs in This Window"),
++            .description = i18n.N_("Join all tabs and splits in the current window to one broadcast input group."),
++        }},
++
+         .quit => comptime &.{.{
+             .action = .quit,
+             .title = i18n.N_("Quit"),

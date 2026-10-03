@@ -277,3 +277,15 @@ index b4b1fbb..0b90da1 100644
          .quit => comptime &.{.{
              .action = .quit,
              .title = i18n.N_("Quit"),
+diff --git a/src/main_ghostty.zig b/src/main_ghostty.zig
+index f4fa741..d04fc58 100644
+--- a/src/main_ghostty.zig
++++ b/src/main_ghostty.zig
+@@ -232,6 +232,7 @@ pub const std_options: std.Options = .{
+ };
+ 
+ test {
++    _ = App;
+     _ = @import("pty.zig");
+     _ = @import("Command.zig");
+     _ = @import("font/main.zig");

@@ -4,7 +4,7 @@ name: Build Ghostty Broadcast
   workflow_dispatch:
   push:
     branches: [main]
-    paths: [.github/workflows/build-ghostty-broadcast.yml]
+    paths: [.github/workflows/build-ghostty-broadcast.yml, patches/**]
 
 permissions:
   contents: read
@@ -17,6 +17,12 @@ jobs:
       run:
         shell: bash
     steps:
+      - name: Checkout build inputs
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: build-inputs
+          persist-credentials: false
+
       - name: Checkout PR 13745 at the reviewed revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -24,6 +30,13 @@ jobs:
           ref: 72607587674b4d15922dcc024d6911d87b0b2711
           path: ghostty
           persist-credentials: false
+
+      - name: Apply current-window broadcast patch
+        working-directory: ghostty
+        run: |
+          set -euo pipefail
+          git apply --check ../build-inputs/patches/window-broadcast.patch
+          git apply ../build-inputs/patches/window-broadcast.patch
 
       - name: Set up Xcode and Metal
         run: |
@@ -34,12 +47,14 @@ jobs:
           xcodebuild -downloadComponent MetalToolchain
           xcrun --sdk macosx metal --version
 
-      - name: Install Zig 0.16.0 and gettext
+      - name: Install Zig 0.16.0 and build tools
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
         run: |
           set -euo pipefail
           brew list gettext >/dev/null 2>&1 || brew install gettext
+          brew list nushell >/dev/null 2>&1 || brew install nushell
+          brew list swiftlint >/dev/null 2>&1 || brew install swiftlint
           mkdir -p "$RUNNER_TEMP/ghostty-zig"
           cd "$RUNNER_TEMP/ghostty-zig"
           curl --fail --location --retry 3 \
@@ -50,18 +65,27 @@ jobs:
           echo "$RUNNER_TEMP/ghostty-zig/zig-aarch64-macos-0.16.0" >> "$GITHUB_PATH"
           echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
 
+      - name: Check formatting and focused regression tests
+        working-directory: ghostty
+        run: |
+          set -euo pipefail
+          zig fmt --check src/App.zig src/Surface.zig src/input/Binding.zig src/input/command.zig src/config/Config.zig src/apprt/action.zig src/apprt/embedded.zig src/apprt/gtk/class/application.zig
+          swiftlint lint --strict --fix macos/Sources/Ghostty/Ghostty.App.swift
+          zig build test -Demit-macos-app=false -Dtest-filter="window broadcast group" -Dtest-filter="ghostty.h Action.Key" -j3
+
       - name: Build native arm64 ReleaseLocal app
         working-directory: ghostty
         run: |
           set -euo pipefail
           test "$(zig version)" = 0.16.0
-          zig build -Doptimize=ReleaseFast -Dxcframework-target=native -j3
+          zig build -Demit-macos-app=false -Doptimize=ReleaseFast -Dxcframework-target=native -Dversion-string=1.3.2-window-broadcast+7260758 -j3
+          nu macos/build.nu --configuration ReleaseLocal --arch arm64
 
       - name: Verify and package
         working-directory: ghostty
         run: |
           set -euo pipefail
-          app=zig-out/Ghostty.app
+          app=macos/build/ReleaseLocal/Ghostty.app
           binary="$app/Contents/MacOS/ghostty"
           test -x "$binary"
           test "$(lipo -archs "$binary")" = arm64
@@ -69,9 +93,14 @@ jobs:
           "$binary" +list-actions > "$RUNNER_TEMP/ghostty-actions.txt"
           grep -q toggle_broadcast_group "$RUNNER_TEMP/ghostty-actions.txt"
           grep -q clear_broadcast_groups "$RUNNER_TEMP/ghostty-actions.txt"
+          grep -q join_window_broadcast_group "$RUNNER_TEMP/ghostty-actions.txt"
+          "$binary" +validate-config
+          "$binary" +list-keybinds > "$RUNNER_TEMP/ghostty-keybinds.txt"
+          grep -q 'ctrl+super+i=join_window_broadcast_group' "$RUNNER_TEMP/ghostty-keybinds.txt"
           mkdir -p ../dist
           ditto -c -k --sequesterRsrc --keepParent "$app" ../dist/Ghostty-Broadcast-arm64.zip
           git rev-parse HEAD > ../dist/SOURCE_COMMIT.txt
+          shasum -a 256 ../build-inputs/patches/window-broadcast.patch > ../dist/PATCH_SHA256.txt
           cd ../dist
           shasum -a 256 Ghostty-Broadcast-arm64.zip > SHA256SUMS.txt
 

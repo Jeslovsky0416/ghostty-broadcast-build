@@ -71,6 +71,7 @@ jobs:
           set -euo pipefail
           zig fmt --check src/App.zig src/Surface.zig src/input/Binding.zig src/input/command.zig src/config/Config.zig src/apprt/action.zig src/apprt/embedded.zig src/apprt/gtk/class/application.zig
           swiftlint lint --strict --fix macos/Sources/Ghostty/Ghostty.App.swift
+          swiftlint lint --strict macos/Sources/Ghostty/Ghostty.App.swift
           zig build test -Demit-macos-app=false -Dtest-filter="window broadcast group" -Dtest-filter="ghostty.h Action.Key" -j3
 
       - name: Build native arm64 ReleaseLocal app
@@ -96,7 +97,7 @@ jobs:
           grep -q join_window_broadcast_group "$RUNNER_TEMP/ghostty-actions.txt"
           "$binary" +validate-config
           "$binary" +list-keybinds > "$RUNNER_TEMP/ghostty-keybinds.txt"
-          grep -q 'ctrl+super+i=join_window_broadcast_group' "$RUNNER_TEMP/ghostty-keybinds.txt"
+          grep -q 'super+ctrl+i=join_window_broadcast_group' "$RUNNER_TEMP/ghostty-keybinds.txt"
           mkdir -p ../dist
           ditto -c -k --sequesterRsrc --keepParent "$app" ../dist/Ghostty-Broadcast-arm64.zip
           git rev-parse HEAD > ../dist/SOURCE_COMMIT.txt

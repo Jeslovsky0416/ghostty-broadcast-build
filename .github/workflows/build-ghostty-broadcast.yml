@@ -1,0 +1,84 @@
+name: Build Ghostty Broadcast
+
+"on":
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/build-ghostty-broadcast.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout PR 13745 at the reviewed revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ghostty-org/ghostty
+          ref: 72607587674b4d15922dcc024d6911d87b0b2711
+          path: ghostty
+          persist-credentials: false
+
+      - name: Set up Xcode and Metal
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          sudo xcode-select --switch /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+          xcodebuild -downloadComponent MetalToolchain
+          xcrun --sdk macosx metal --version
+
+      - name: Install Zig 0.16.0 and gettext
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          set -euo pipefail
+          brew list gettext >/dev/null 2>&1 || brew install gettext
+          mkdir -p "$RUNNER_TEMP/ghostty-zig"
+          cd "$RUNNER_TEMP/ghostty-zig"
+          curl --fail --location --retry 3 \
+            https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz \
+            --output zig.tar.xz
+          echo 'b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489  zig.tar.xz' | shasum -a 256 -c -
+          tar -xf zig.tar.xz
+          echo "$RUNNER_TEMP/ghostty-zig/zig-aarch64-macos-0.16.0" >> "$GITHUB_PATH"
+          echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+
+      - name: Build native arm64 ReleaseLocal app
+        working-directory: ghostty
+        run: |
+          set -euo pipefail
+          test "$(zig version)" = 0.16.0
+          zig build -Doptimize=ReleaseFast -Dxcframework-target=native -j3
+
+      - name: Verify and package
+        working-directory: ghostty
+        run: |
+          set -euo pipefail
+          app=zig-out/Ghostty.app
+          binary="$app/Contents/MacOS/ghostty"
+          test -x "$binary"
+          test "$(lipo -archs "$binary")" = arm64
+          codesign --verify --deep --strict "$app"
+          "$binary" +list-actions > "$RUNNER_TEMP/ghostty-actions.txt"
+          grep -q toggle_broadcast_group "$RUNNER_TEMP/ghostty-actions.txt"
+          grep -q clear_broadcast_groups "$RUNNER_TEMP/ghostty-actions.txt"
+          mkdir -p ../dist
+          ditto -c -k --sequesterRsrc --keepParent "$app" ../dist/Ghostty-Broadcast-arm64.zip
+          git rev-parse HEAD > ../dist/SOURCE_COMMIT.txt
+          cd ../dist
+          shasum -a 256 Ghostty-Broadcast-arm64.zip > SHA256SUMS.txt
+
+      - name: Upload app archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Ghostty-Broadcast-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
